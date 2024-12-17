@@ -1,0 +1,178 @@
+
+
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+from time import sleep
+import os
+
+# Load the CSV file containing company names and URLs
+input_file = "C:/Users/corin/Desktop/companies.csv"  # Replace with your CSV file name
+companies = pd.read_csv(input_file,delimiter=";")
+
+
+
+
+# Define the timestamps for the last 5 years
+timestamps = ["20190101", "20200101", "20210101", "20220101", "20230101"]
+
+# Output file
+output_file = "mission_statements.csv"
+temp_file = "temp_mission_statements.csv"
+
+# Function to save results safely using a temporary file
+def save_results_safely(results, output_file, temp_file):
+    """
+    Save results to a temporary file, then replace the main output file atomically.
+    """
+    try:
+        # Write to the temporary file
+        pd.DataFrame(results).to_csv(temp_file, index=False)
+        # Replace the main file with the temporary file
+        os.replace(temp_file, output_file)
+        print(f"Results saved to '{output_file}'.")
+    except Exception as e:
+        print(f"Error saving file: {e}")
+
+# Function to construct possible "About Us" URLs
+def construct_about_us_url(base_url, company_name):
+    """
+    Construct possible "About Us" URLs from the base domain, including:
+    1. Static paths like /company, /aboutus.
+    2. Dynamic paths containing "about" with and without dashes and the company name.
+    3. Paths with optional # or #about.
+
+    Args:
+        base_url (str): The base URL of the company's website.
+        company_name (str): The company name to include in dynamic paths.
+
+    Returns:
+        list: A list of potential "About Us" URLs.
+    """
+    # Normalize the company name for URL-friendly paths
+    company_slug = company_name.lower().replace(" ", "-").replace(",", "")
+    company_slug_nodash = company_name.lower().replace(" ", "").replace(",", "")
+
+    # Static paths
+    static_paths = ["/about-us", "/about", "/aboutus", "/company"]
+
+    # Dynamic paths
+    dynamic_paths = [
+        f"/about-{company_slug}",
+        f"/about{company_slug_nodash}",
+    ]
+
+    # Paths with # and #about
+    hash_paths = [
+        "/#",
+        "/#about",
+        f"/#/about-{company_slug}",
+        f"/#/about{company_slug_nodash}",
+    ]
+
+    # Language prefixes ("/en" optional)
+    language_prefixes = ["", "/en"]
+
+    # Combine all paths
+    all_paths = []
+    for prefix in language_prefixes:
+        for path in static_paths + dynamic_paths + hash_paths:
+            all_paths.append(f"{base_url.rstrip('/')}{prefix}{path}")
+
+    return all_paths
+
+# Function to get Wayback Machine snapshot URL
+def get_wayback_snapshot(url, timestamp):
+    """
+    Retrieve the closest Wayback Machine snapshot for a given URL and timestamp.
+    """
+    api_url = f"http://archive.org/wayback/available?url={url}&timestamp={timestamp}"
+    response = requests.get(api_url)
+    if response.status_code == 200:
+        data = response.json()
+        if 'archived_snapshots' in data and 'closest' in data['archived_snapshots']:
+            return data['archived_snapshots']['closest']['url']
+    return None
+
+# Function to extract mission statement
+def extract_mission_statement(archive_url):
+    """
+    Extract mission statement from the archived 'About Us' page.
+    """
+    try:
+        response = requests.get(archive_url)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Keywords for searching
+            keywords = ["mission", "purpose", "vision", "values"]
+
+            # Search for headings with keywords
+            for keyword in keywords:
+                heading = soup.find(['h1', 'h2', 'h3'], string=lambda text: text and keyword in text.lower())
+                if heading:
+                    mission = heading.find_next(['p', 'div'])
+                    if mission and len(mission.get_text(strip=True)) > 50:
+                        return mission.get_text(strip=True)
+            
+            # Search sections with IDs or classes containing "mission"
+            mission_section = soup.find(id=lambda x: x and "mission" in x.lower()) or \
+                              soup.find(class_=lambda x: x and "mission" in x.lower())
+            if mission_section:
+                text = mission_section.get_text(strip=True)
+                if len(text) > 50:
+                    return text
+
+            # General fallback: Long meaningful paragraphs
+            paragraphs = soup.find_all('p')
+            for paragraph in paragraphs:
+                text = paragraph.get_text(strip=True)
+                if len(text) > 100 and not any(word in text.lower() for word in ["product", "service", "feature"]):
+                    return text
+
+        return "No mission statement found on the page."
+    except Exception as e:
+        return f"Error extracting mission statement: {e}"
+
+# Main automation loop
+results = []
+
+# Check for existing results and load them
+if os.path.exists(output_file):
+    existing_data = pd.read_csv(output_file)
+    results = existing_data.to_dict('records')
+
+for index, row in companies.iterrows():
+    company_name = row['name']
+    base_url = row['domain']
+    print(f"Processing {company_name}...")
+
+    # Construct potential URLs
+    about_us_urls = construct_about_us_url(base_url, company_name)
+
+    # Find Wayback Machine snapshots
+    snapshots_per_year = {}
+    for timestamp in timestamps:
+        if timestamp[:4] in snapshots_per_year:
+            continue
+        for about_url in about_us_urls:
+            snapshot_url = get_wayback_snapshot(about_url, timestamp)
+            if snapshot_url:
+                snapshots_per_year[timestamp[:4]] = snapshot_url
+                break
+
+    # Extract mission statements
+    for year, snapshot_url in snapshots_per_year.items():
+        print(f"  Extracting mission statement for {company_name} ({year})...")
+        mission = extract_mission_statement(snapshot_url)
+        results.append({
+            "Company Name": company_name,
+            "Year": year,
+            "Archived URL": snapshot_url,
+            "Mission Statement": mission
+        })
+
+        # Save results periodically
+        save_results_safely(results, output_file, temp_file)
+
+print("Data collection complete.") 
